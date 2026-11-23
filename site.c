@@ -147,11 +147,13 @@ static void grow(Buf *b, u32 extra) {
 
 // n bytes from p to q, 16 at a time: it may write up to 15 bytes past q + n and read up to 15 past p + n, so every
 // buffer keeps that much room. (memory.copy is a call out of Liftoff's code, dear for a short run.)
-static void copy16(u8 *q, const u8 *p, u32 n) {
+#define INLINE static inline __attribute__((always_inline))
+
+INLINE void copy16(u8 *q, const u8 *p, u32 n) {
   for (u32 k = 0; k < n; k += 16) wasm_v128_store(q + k, wasm_v128_load(p + k));
 }
 
-static void put(const u8 *p, u32 n) {
+INLINE void put(const u8 *p, u32 n) {
   ROOM(n + 32);
   u8 *q = W->p + W->len;
   if (n <= 32) {
@@ -168,51 +170,66 @@ static void puts_(S s) { put(s.p, s.n); }
 
 static const u8 HEX[] = "0123456789abcdef";
 
-// p[0, n) HTML-escaped (& < > " ') and then JSON-escaped. A block of 16 bytes needing neither is stored whole.
-static void put_text(const u8 *p, u32 n) {
+// Byte classes by nibble lookup (two swizzles in place of a compare per character): a byte is in a set when the entry
+// of its low nibble and the entry of its high nibble share a bit. Bit 1: below 0x20 (high nibble 0 or 1). Bit 2:
+// " & ' (high 2). Bit 4: < > (high 3). Bit 8: \ (high 5). Bit 16: * (high 2). Bit 32: [ (high 5). Bit 64: ` (high 6).
+// A byte at or past 0x80 has a high nibble whose entry is 0.
+#define LO_TBL wasm_i8x16_make(1 | 64, 1, 1 | 2, 1, 1, 1, 1 | 2, 1 | 2, 1, 1, 1 | 16, 1 | 32, 1 | 4 | 8, 1, 1 | 4, 1)
+#define HI_TBL wasm_i8x16_make(1, 1, 2 | 16, 4, 0, 8 | 32, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+// The bits of the 16 bytes of v whose classes meet `set`.
+INLINE u32 classes(v128_t v, u8 set) {
+  v128_t lo = wasm_i8x16_swizzle(LO_TBL, wasm_v128_and(v, SPLAT(0x0f)));
+  v128_t hi = wasm_i8x16_swizzle(HI_TBL, wasm_u8x16_shr(v, 4));
+  v128_t m = wasm_v128_and(wasm_v128_and(lo, hi), SPLAT(set));
+  return BITS(wasm_i8x16_ne(m, wasm_i8x16_splat(0)));
+}
+#define C_TEXT (1 | 2 | 4 | 8)        // what put_text escapes
+#define C_INLINE (C_TEXT | 16 | 32 | 64)  // and what opens something inline: \ ` * [
+
+// One character that HTML or JSON escapes, written at q; past it.
+__attribute__((noinline)) static u8 *esc_text(u8 *q, u8 c) {
+  switch (c) {
+    case '&': *q++ = '&'; *q++ = 'a'; *q++ = 'm'; *q++ = 'p'; *q++ = ';'; break;
+    case '<': *q++ = '&'; *q++ = 'l'; *q++ = 't'; *q++ = ';'; break;
+    case '>': *q++ = '&'; *q++ = 'g'; *q++ = 't'; *q++ = ';'; break;
+    case '"': *q++ = '&'; *q++ = 'q'; *q++ = 'u'; *q++ = 'o'; *q++ = 't'; *q++ = ';'; break;
+    case '\'': *q++ = '&'; *q++ = '#'; *q++ = '3'; *q++ = '9'; *q++ = ';'; break;
+    case '\\': *q++ = '\\'; *q++ = '\\'; break;
+    case '\n': *q++ = '\\'; *q++ = 'n'; break;
+    case '\t': *q++ = '\\'; *q++ = 't'; break;
+    default: *q++ = '\\'; *q++ = 'u'; *q++ = '0'; *q++ = '0'; *q++ = HEX[c >> 4]; *q++ = HEX[c & 15];
+  }
+  return q;
+}
+
+// One character, escaped if HTML or JSON escapes it.
+INLINE u8 *esc_or_copy(u8 *q, u8 c) {
+  if (c == '&' || c == '<' || c == '>' || c == '"' || c == '\'' || c == '\\' || c < 0x20) return esc_text(q, c);
+  *q = c;
+  return q + 1;
+}
+
+// p[0, n) HTML-escaped (& < > " ') and then JSON-escaped, a block of 16 at a time (the last one masked to what is
+// left: reading past p + n is safe, see copy16); each block is stored whole, then the pointer moves past what was clean.
+INLINE void put_text(const u8 *p, u32 n) {
   ROOM(n * 6 + 32);
   u8 *q = W->p + W->len;
   u32 k = 0;
-  for (;;) {
-    // a block at a time, the last one masked to what is left (reading past p + n is safe: see copy16)
-    while (k < n) {
-      v128_t v = wasm_v128_load(p + k);
-      v128_t m = wasm_u8x16_lt(v, SPLAT(0x20));
-      m = wasm_v128_or(m, wasm_v128_or(EQ(v, '"'), EQ(v, '&')));
-      m = wasm_v128_or(m, wasm_v128_or(EQ(v, '\''), EQ(v, '<')));
-      m = wasm_v128_or(m, wasm_v128_or(EQ(v, '>'), EQ(v, '\\')));
-      wasm_v128_store(q, v);
-      u32 left = n - k;
-      u32 b = BITS(m);
-      if (left < 16) b &= (1u << left) - 1;
-      if (!b) {
-        u32 adv = left < 16 ? left : 16;
-        q += adv;
-        k += adv;
-        continue;
-      }
-      u32 z = __builtin_ctz(b);
-      q += z;
-      k += z;
-      break;
-    }
-    if (k >= n) break;
-    u8 c = p[k++];
-    if (c >= 0x40 || (c >= 0x28 && c != 0x3c && c != 0x3e) || c == 0x20 || c == 0x21 || c == 0x23 || c == 0x24 || c == 0x25) {
-      if (c == '\\') *q++ = '\\';
-      *q++ = c;
+  while (k < n) {
+    v128_t v = wasm_v128_load(p + k);
+    wasm_v128_store(q, v);
+    u32 left = n - k;
+    u32 b = classes(v, C_TEXT);
+    if (left < 16) b &= (1u << left) - 1;
+    if (!b) {
+      u32 adv = left < 16 ? left : 16;
+      q += adv;
+      k += adv;
       continue;
     }
-    switch (c) {
-      case '&': *q++ = '&'; *q++ = 'a'; *q++ = 'm'; *q++ = 'p'; *q++ = ';'; break;
-      case '<': *q++ = '&'; *q++ = 'l'; *q++ = 't'; *q++ = ';'; break;
-      case '>': *q++ = '&'; *q++ = 'g'; *q++ = 't'; *q++ = ';'; break;
-      case '"': *q++ = '&'; *q++ = 'q'; *q++ = 'u'; *q++ = 'o'; *q++ = 't'; *q++ = ';'; break;
-      case '\'': *q++ = '&'; *q++ = '#'; *q++ = '3'; *q++ = '9'; *q++ = ';'; break;
-      case '\n': *q++ = '\\'; *q++ = 'n'; break;
-      case '\t': *q++ = '\\'; *q++ = 't'; break;
-      default: *q++ = '\\'; *q++ = 'u'; *q++ = '0'; *q++ = '0'; *q++ = HEX[c >> 4]; *q++ = HEX[c & 15];
-    }
+    u32 z = __builtin_ctz(b);
+    q = esc_text(q + z, p[k + z]);
+    k += z + 1;
   }
   W->len = (u32)(q - W->p);
 }
@@ -1636,96 +1653,105 @@ static u32 sstar(const u8 *s, u32 from, u32 to) {
   return NONE;
 }
 
+// s[i, to) rendered inline, written HTML- and JSON-escaped. One pass: each block of 16 bytes is stored as it is, and the
+// write pointer moves past what holds nothing to escape and nothing that opens a code span, emphasis or a link; such a
+// character is then handled on its own.
 static void inl(const u8 *s, u32 i, u32 to) {
-  u32 run = i;
+  ROOM((to - i) * 6 + 64);
+  u8 *q = W->p + W->len;
   while (i < to) {
-    // the next \ ` * or [, a block at a time
-    while (i + 16 <= to) {
-      v128_t v = wasm_v128_load(s + i);
-      u32 b = BITS(wasm_v128_or(wasm_v128_or(EQ(v, '\\'), EQ(v, '`')), wasm_v128_or(EQ(v, '*'), EQ(v, '['))));
-      if (b) {
-        i += __builtin_ctz(b);
-        break;
-      }
-      i += 16;
+    v128_t v = wasm_v128_load(s + i);
+    wasm_v128_store(q, v);
+    u32 left = to - i;
+    u32 b = classes(v, C_INLINE);
+    if (left < 16) b &= (1u << left) - 1;
+    if (!b) {
+      u32 adv = left < 16 ? left : 16;
+      q += adv;
+      i += adv;
+      continue;
     }
-    if (i >= to) break;
+    u32 z = __builtin_ctz(b);
+    q += z;
+    i += z;
     u8 c = s[i];
-    if (c >= 128 || !SPECIAL[c]) {
+    if (c == '\\') {
+      if (escapable(s, i + 1, to)) {
+        q = esc_or_copy(q, s[i + 1]);
+        i += 2;
+      } else {
+        q = esc_text(q, c);
+        i++;
+      }
+      continue;
+    }
+    if (c != '`' && c != '*' && c != '[') {
+      q = esc_text(q, c);
       i++;
       continue;
     }
-    if (c == '\\') {
-      if (escapable(s, i + 1, to)) {
-        put_text(s + run, i - run);
-        put_text(s + i + 1, 1);
-        i += 2;
-        run = i;
-      } else
-        i++;
-      continue;
-    }
+    // a code span, emphasis or a link: through put and the rest, which keep W->len
+    W->len = (u32)(q - W->p);
     if (c == '`') {
       u32 j = i + 1;
       while (j < to && s[j] != '`') j++;
       if (j < to && j > i + 1) {
-        put_text(s + run, i - run);
         LIT("<code>");
         put_text(s + i + 1, j - i - 1);
         LIT("</code>");
         i = j + 1;
-        run = i;
-      } else
+      } else {
+        LIT("`");
         i++;
-      continue;
-    }
-    if (c == '*') {
+      }
+    } else if (c == '*') {
       if (i + 1 < to && s[i + 1] == '*') {
         u32 j = dstar(s, i + 2, to);
         if (j != NONE && j > i + 2) {
-          put_text(s + run, i - run);
           LIT("<strong>");
           inl(s, i + 2, j);
           LIT("</strong>");
           i = j + 2;
-          run = i;
-        } else
+        } else {
+          LIT("**");
           i += 2;
-        continue;
+        }
+      } else {
+        u32 j = sstar(s, i + 1, to);
+        if (j != NONE && j > i + 1) {
+          LIT("<em>");
+          inl(s, i + 1, j);
+          LIT("</em>");
+          i = j + 1;
+        } else {
+          LIT("*");
+          i++;
+        }
       }
-      u32 j = sstar(s, i + 1, to);
-      if (j != NONE && j > i + 1) {
-        put_text(s + run, i - run);
-        LIT("<em>");
-        inl(s, i + 1, j);
-        LIT("</em>");
-        i = j + 1;
-        run = i;
-      } else
+    } else {
+      u32 kk = find1(s, ']', i + 1, to);
+      u32 m = NONE;
+      if (kk != NONE && kk + 1 < to && s[kk + 1] == '(') {
+        m = kk + 2;
+        while (m < to && s[m] != ')') m++;
+        if (m == to) m = NONE;
+      }
+      if (m != NONE && m > kk + 2 && !has_ws(s + kk + 2, m - kk - 2)) {
+        LIT("<a href=\\\"");
+        link(s + kk + 2, m - kk - 2);
+        LIT("\\\">");
+        inl(s, i + 1, kk);
+        LIT("</a>");
+        i = m + 1;
+      } else {
+        LIT("[");
         i++;
-      continue;
+      }
     }
-    u32 kk = find1(s, ']', i + 1, to);
-    u32 m = NONE;
-    if (kk != NONE && kk + 1 < to && s[kk + 1] == '(') {
-      m = kk + 2;
-      while (m < to && s[m] != ')') m++;
-      if (m == to) m = NONE;
-    }
-    if (m != NONE && m > kk + 2 && !has_ws(s + kk + 2, m - kk - 2)) {
-      put_text(s + run, i - run);
-      LIT("<a href=\\\"");
-      link(s + kk + 2, m - kk - 2);
-      LIT("\\\">");
-      inl(s, i + 1, kk);
-      LIT("</a>");
-      i = m + 1;
-      run = i;
-      continue;
-    }
-    i++;
+    ROOM((to - i) * 6 + 64);
+    q = W->p + W->len;
   }
-  put_text(s + run, to - run);
+  W->len = (u32)(q - W->p);
 }
 
 static const u8 *B;
@@ -1997,23 +2023,33 @@ static void render_markdown(Src *s) {
         LIT("</ol>\\n");
       continue;
     }
-    tl = 0;
-    {
-      u32 la = a, le = e;
-      trim(&la, &le);
-      tput(la, le);
-    }
+    // A paragraph: this line and the next ones up to a blank line, a fence, a heading or a thematic break, each
+    // trimmed of spaces and tabs and joined by "\n". When no line has any to trim, that is the body's own span.
+    u32 first = i;
+    int clean = 1;
     i++;
-    while (i < nlines && !ends_paragraph(LS(i), LE(i))) {
-      u32 la = LS(i), le = LE(i);
-      trim(&la, &le);
-      T[tl++] = '\n';
-      tput(la, le);
-      i++;
+    while (i < nlines && !ends_paragraph(LS(i), LE(i))) i++;
+    for (u32 k = first; k < i && clean; k++) {
+      u8 x0 = B[LS(k)], x1 = B[LE(k) - 1];
+      clean = x0 != ' ' && x0 != '\t' && x1 != ' ' && x1 != '\t';
+    }
+    const u8 *ps = B;
+    u32 pa = LS(first), pe = LE(i - 1);
+    if (!clean) {
+      tl = 0;
+      for (u32 k = first; k < i; k++) {
+        u32 la = LS(k), le = LE(k);
+        trim(&la, &le);
+        if (k > first) T[tl++] = '\n';
+        tput(la, le);
+      }
+      ps = T;
+      pa = 0;
+      pe = tl;
     }
     LIT("<p>");
     u32 p0 = MDB.len;
-    inl(T, 0, tl);
+    inl(ps, pa, pe);
     u32 p1 = MDB.len;
     LIT("</p>\\n");
     if (s->ex_off == NONE) {
@@ -2232,10 +2268,11 @@ static u32 *coff, *clen;   // its bytes in CB, once rendered (coff NONE before)
 static Buf CB;
 
 static int body_const(u32 n, u32 depth, const S *bound, u32 nb);
+static int loop_ok;  // whether `loop` reads a loop of the subtree's own (or no loop at all), not the one around it
 
 static int path_const(u32 pi, const S *bound, u32 nb) {
   Path *p = &paths[pi];
-  if (p->ids[0] == F_loop) return 1;
+  if (p->ids[0] == F_loop) return loop_ok;
   for (u32 k = 0; k < nb; k++)
     if (seq(bound[k], p->names[0])) return 1;
   u32 id = p->ids[0];
@@ -2254,7 +2291,11 @@ static int node_const(u32 n, u32 depth, const S *bound, u32 nb) {
       S inner[33];
       for (u32 k = 0; k < nb; k++) inner[k] = bound[k];
       inner[nb] = mk((const u8 *)d->b, d->c);
-      return body_const(d->d, depth, inner, nb + 1);
+      int was = loop_ok;
+      loop_ok = 1;
+      int r = body_const(d->d, depth, inner, nb + 1);
+      loop_ok = was;
+      return r;
     }
     case N_INCLUDE: return d->a == NONE || depth >= 8 || body_const(tpls[d->a].head, depth + 1, bound, nb);
   }
@@ -2301,15 +2342,84 @@ static void render_node(u32 n, u32 depth) {
   }
 }
 
+// An include inside one loop whose template names only site, tags, recent and the loop's element (never `loop`, which
+// moves with the index) writes the same bytes for the same element wherever it is: a card of a post, listed on the
+// index and on each of its tags' pages. Kept by template, include depth, the element's name and the element.
+typedef struct {
+  u32 tpl, depth, k, a, off, len;
+  S name;
+} Card;
+#define CARD_SLOTS 4096
+static Card *cards;
+static u32 ncards;
+static S fname;    // the bound name iflag holds flags for
+static u8 *iflag;  // per template and depth, for one bound name: 0 unknown, 1 cacheable, 2 not (reset per name)
+
+static void render_node(u32 n, u32 depth);
+
+// 1 when include node n was written from the cache or rendered and kept.
+static int card_include(u32 n, u32 depth) {
+  Node *d = &nodes[n];
+  Frame *fr = &frames[0];
+  if (d->a == NONE || depth >= 8 || fr->x.t != T_OBJ) return 0;
+  u32 fi = (d->a * 9 + depth) * 2;
+  // the flag is kept per template and depth, for the bound name it was worked out with
+  if (!seq(fname, fr->name)) {
+    __builtin_memset(iflag, 0, ntpl * 9 * 2);
+    fname = fr->name;
+  }
+  if (!iflag[fi]) {
+    loop_ok = 0;
+    S bound[1] = {fr->name};
+    iflag[fi] = body_const(tpls[d->a].head, depth + 1, bound, 1) ? 1 : 2;
+  }
+  if (iflag[fi] != 1) return 0;
+  u32 h = (d->a * 31 + depth * 7 + fr->x.k * 131 + fr->x.a * 2654435761u) & (CARD_SLOTS - 1);
+  for (;; h = (h + 1) & (CARD_SLOTS - 1)) {
+    Card *c = &cards[h];
+    if (c->len == NONE) break;
+    if (c->tpl == d->a && c->depth == depth && c->k == fr->x.k && c->a == fr->x.a && seq(c->name, fr->name)) {
+      put(CB.p + c->off, c->len);
+      return 1;
+    }
+  }
+  if (ncards * 2 > CARD_SLOTS) return 0;
+  u32 start = W->len;
+  render_node(n, depth);
+  u32 len = W->len - start;
+  if (CB.len + len + 64 > CB.cap) {
+    Buf *back = W;
+    W = &CB;
+    grow(&CB, len + 64);
+    W = back;
+  }
+  __builtin_memcpy(CB.p + CB.len, W->p + start, len);
+  Card *c = &cards[h];
+  c->tpl = d->a;
+  c->depth = depth;
+  c->k = fr->x.k;
+  c->a = fr->x.a;
+  c->name = fr->name;
+  c->off = CB.len;
+  c->len = len;
+  ncards++;
+  CB.len += len;
+  return 1;
+}
+
 static void render(u32 n, u32 depth) {
   for (; n != NONE; n = nodes[n].next) {
     u32 kind = nodes[n].kind;
+    if (nframes == 1 && kind == N_INCLUDE && card_include(n, depth)) continue;
     if (nframes || kind < N_IF) {
       render_node(n, depth);
       continue;
     }
     u32 ci = depth * nnodes + n;
-    if (!cflag[ci]) cflag[ci] = node_const(n, depth, 0, 0) ? 1 : 2;
+    if (!cflag[ci]) {
+      loop_ok = 1;
+      cflag[ci] = node_const(n, depth, 0, 0) ? 1 : 2;
+    }
     if (cflag[ci] == 2) {
       render_node(n, depth);
       continue;
@@ -2634,6 +2744,11 @@ static void build_case(void) {
   __builtin_memset(coff, 0xff, nnodes * 9 * 4);
   clen = bump(nnodes * 9 * 4 + 16);
   CB.len = 0;
+  cards = bump(CARD_SLOTS * sizeof(Card));
+  for (u32 q = 0; q < CARD_SLOTS; q++) cards[q].len = NONE;
+  ncards = 0;
+  fname = EMPTY;
+  iflag = zalloc(ntpl * 9 * 2 + 16);
   map_init(&outkeys, nkept + 64);
   W = &OUT;
   LIT("{\"build-report.txt\":\"");
@@ -2907,6 +3022,7 @@ __attribute__((export_name("run"))) void run(void) {
   if (!peek(']'))
     for (;;) {
       nnodes = nodecap = 0;
+      ntoks = tokcap = 0;
       npaths = pathcap = 0;
       ntocs = toccap = 0;
       nreport = reportcap = 0;
