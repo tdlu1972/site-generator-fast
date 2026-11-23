@@ -6,11 +6,12 @@
 
 A faster drop-in for makefun-site 1.0.0 whose output tree is identical, refused sources, broken links and all.
 
-`fast.js` runs the reference's pipeline with three changes of method. Markdown is read with character scans straight to HTML, with no token objects. Each layout is compiled once into a JavaScript function: every value a template can name has a known shape, so each path resolves while compiling, and whatever depends only on the site (the nav, the tag lists, the recent posts) is rendered once, as constant text. Every output file is built already JSON-escaped, so the answer is never stringified as a tree. A site it does not read the reference's way makes it throw, and `main.ts` answers that site with the reference itself, `vendor/makefun-site` (MIT, see its NOTICE).
+`fast.js` runs the reference's pipeline with three changes of method. Markdown is rendered by `md.wasm` (built from `md.c` with `build.sh`), which reads each body's UTF-8 bytes and writes the HTML's JSON spelling, its links resolved against the site's table, with the table of contents, the excerpt and the word count beside it; the HTML of a whole site is decoded once and sliced. Each layout is compiled once into a JavaScript function: every value a template can name has a known shape, so each path resolves while compiling, and whatever depends only on the site (the nav, the tag lists, the recent posts) is rendered once, as constant text. Every output file is built already JSON-escaped, so the answer is never stringified as a tree. A site it does not read the reference's way makes it throw, and `main.ts` answers that site with the reference itself, `vendor/makefun-site` (MIT, see its NOTICE).
 
 ## Run it
 
 ```sh
+./build.sh   # only after changing md.c; md.wasm is committed
 MAKEFUN_INPUT_DIR=practice/input MAKEFUN_OUTPUT_DIR=out node main.ts
 ```
 
